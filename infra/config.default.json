@@ -1,0 +1,67 @@
+{
+  "location": "westus3",
+  "workloadName": "ai",
+  "nameSuffix": "l7x2q9",
+  "projectName": "default-project",
+  "resourceNames": {},
+  "tags": {
+    "environment": "lab",
+    "workload": "foundry",
+    "managedBy": "bicep"
+  },
+  "network": {
+    "hubAddressPrefix": "10.10.0.0/16",
+    "bastionSubnetPrefix": "10.10.0.0/26",
+    "firewallSubnetPrefix": "10.10.1.0/26",
+    "jumpboxSubnetPrefix": "10.10.2.0/24",
+    "spokeAddressPrefix": "10.20.0.0/16",
+    "agentSubnetName": "snet-agents",
+    "agentSubnetPrefix": "10.20.0.0/24",
+    "privateEndpointSubnetName": "snet-private-endpoints",
+    "privateEndpointSubnetPrefix": "10.20.1.0/24"
+  },
+  "hub": {
+    "bastionSku": "Standard",
+    "firewallSku": "Standard",
+    "additionalJumpboxFqdns": [],
+    "additionalAgentFqdns": []
+  },
+  "vm": {
+    "size": "Standard_D2s_v4",
+    "adminUsername": "localbootstrap",
+    "imagePublisher": "MicrosoftWindowsDesktop",
+    "imageOffer": "windows-11",
+    "imageSku": "win11-24h2-pro",
+    "imageVersion": "latest",
+    "licenseType": "Windows_Client",
+    "osDiskSizeGB": 128,
+    "osDiskSku": "Premium_LRS",
+    "securityType": "TrustedLaunch"
+  },
+  "services": {
+    "storageSku": "Standard_LRS",
+    "searchSku": "basic",
+    "searchReplicas": 1,
+    "searchPartitions": 1,
+    "cosmosTotalThroughputLimit": 10000,
+    "keyVaultSku": "standard",
+    "logRetentionDays": 30,
+    "logDailyQuotaGB": 1
+  },
+  "models": [
+    {
+      "deploymentName": "text-embedding-3-large",
+      "modelName": "text-embedding-3-large",
+      "version": "1",
+      "sku": "GlobalStandard",
+      "capacity": 10
+    },
+    {
+      "deploymentName": "gpt-5-nano",
+      "modelName": "gpt-5-nano",
+      "version": "2025-08-07",
+      "sku": "GlobalStandard",
+      "capacity": 10
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+# Local deployment records, Azure CLI cache, and machine-specific configuration
+.azure/
+.validation/
+*.local.json
+.env
+.env.*
+!.env.example
+
+# Credential exports and private key material
+*.clixml
+*.pfx
+*.p12
+*.pem
+*.key
+
+# Generated ARM templates (keep Bicep sources and default configuration)
+/infra/main.json
+/infra/types.json
+/infra/modules/*.json
+
+# Logs, temporary files, and test output
+*.log
+*.transcript.txt
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+TestResults/
+*.trx
+*.coverage
+
+# Local tooling and operating-system metadata
+.vs/
+.DS_Store
+Thumbs.db
+Desktop.ini
