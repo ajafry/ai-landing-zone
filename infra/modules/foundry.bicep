@@ -64,15 +64,18 @@ module endpoint './private-endpoint.bicep' = {
   }
 }
 
-resource project 'Microsoft.CognitiveServices/accounts/projects@2026-07-15-preview' = {
-  parent: account
-  name: config.projectName
-  location: config.location
-  tags: tags
-  identity: { type: 'SystemAssigned' }
-  properties: {
-    displayName: config.projectName
-    description: 'Private standard Agent Service project with customer-owned data stores.'
+module project './foundry-project.bicep' = {
+  name: 'foundry-project'
+  params: {
+    accountName: account.name
+    projectName: config.projectName
+    location: config.location
+    tags: tags
+    capabilitySettings: {
+      blobStore: storage.id
+      documentStore: cosmos.id
+      vectorStore: search.id
+    }
   }
   dependsOn: [endpoint]
 }
