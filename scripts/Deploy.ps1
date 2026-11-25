@@ -1,13 +1,18 @@
 #Requires -Version 7.2
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('hub', 'foundation', 'foundry', 'access')][string] $Stage,
+    [Parameter(Mandatory)][ValidateSet('hub', 'foundation', 'foundry', 'provisioning', 'access')][string] $Stage,
     [string] $ConfigurationPath = (Join-Path $PSScriptRoot '..\infra\config.default.json'),
     [switch] $Apply,
     [switch] $QuotaReviewed,
     [Security.SecureString] $AdminPassword
 )
 . (Join-Path $PSScriptRoot 'Common.ps1')
+
+if ($Stage -eq 'provisioning') {
+    & (Join-Path $PSScriptRoot 'Provision-ProjectRuntime.ps1') -ConfigurationPath $ConfigurationPath -Apply:$Apply
+    return
+}
 
 $config = Get-Configuration $ConfigurationPath
 $context = Get-InteractiveAzureContext
@@ -30,6 +35,19 @@ if ($Stage -eq 'access') {
     $projectUrl = "https://management.azure.com/subscriptions/$($context.SubscriptionId)/resourceGroups/$($names.spokeResourceGroup)/providers/Microsoft.CognitiveServices/accounts/$($names.foundry)/projects/$($config.projectName)?api-version=2026-07-15-preview"
     $project = Invoke-AzureCli @('rest', '--method', 'get', '--url', $projectUrl)
     if ($project.identity.principalId -notmatch '^[a-fA-F0-9-]{36}$') { throw 'Project managed identity was not provisioned.' }
+    $hostBindings = @()
+    $connections = @()
+    if (-not $project.properties['capabilitySettings']) {
+        $projectBase = $projectUrl.Split('?')[0]
+        $hostBindings = @((Invoke-AzureCli @('rest', '--method', 'get', '--url', "$projectBase/capabilityHosts?api-version=2025-06-01")).value)
+        $connections = @((Invoke-AzureCli @('rest', '--method', 'get', '--url', "$projectBase/connections?api-version=2025-06-01")).value)
+    }
+    $root = "/subscriptions/$($context.SubscriptionId)/resourceGroups/$($names.spokeResourceGroup)/providers"
+    $null = Assert-ProjectStoreBindings -Project $project -CapabilityHosts $hostBindings -Connections $connections -ExpectedStores @{
+        blobStore = "$root/Microsoft.Storage/storageAccounts/$($names.storage)"
+        documentStore = "$root/Microsoft.DocumentDB/databaseAccounts/$($names.cosmos)"
+        vectorStore = "$root/Microsoft.Search/searchServices/$($names.search)"
+    }
     $parameters.projectPrincipalId = @{ value = $project.identity.principalId }
     $containers = @()
     $url = "https://management.azure.com/subscriptions/$($context.SubscriptionId)/resourceGroups/$($names.spokeResourceGroup)/providers/Microsoft.Storage/storageAccounts/$($names.storage)/blobServices/default/containers?api-version=2023-05-01"
@@ -38,13 +56,9 @@ if ($Stage -eq 'access') {
         $containers += @($page.value)
         $url = $page['nextLink']
     } while ($url)
-    $files = @($containers | Where-Object { $_.name -like '*-azureml-blobstore' })
-    $agents = @($containers | Where-Object { $_.name -like '*-azureml-agent' })
-    if ($files.Count -ne 1 -or $agents.Count -ne 1) {
-        throw 'Expected exactly one Foundry file container and one agent container in this dedicated storage account. Inspect capability provisioning; do not grant account-wide data-owner access.'
-    }
-    $parameters.blobContainerName = @{ value = $files[0].name.Split('/')[-1] }
-    $parameters.agentContainerName = @{ value = $agents[0].name.Split('/')[-1] }
+    $projectContainers = Get-ProjectRuntimeContainers -ProjectInternalId $project.properties.internalId -Containers $containers
+    $parameters.blobContainerName = @{ value = $projectContainers.Files }
+    $parameters.agentContainerName = @{ value = $projectContainers.Agents }
 }
 if ($Stage -eq 'hub') {
     if (-not $AdminPassword) { $AdminPassword = Read-Host 'Windows local bootstrap password (use Entra ID for normal login)' -AsSecureString }
@@ -81,7 +95,7 @@ try {
             Set-PrivateJumpboxDisk -Names $result.properties.outputs.resourceNames.value -SubscriptionId $context.SubscriptionId
         }
         Write-Host "$Stage deployment succeeded."
-        if ($Stage -eq 'foundry') { Write-Host 'Run the access stage next; the project is not runtime-ready until its data roles are assigned.' }
+        if ($Stage -eq 'foundry') { Write-Host 'Run the provisioning stage next, then access; ARM project creation alone does not prove runtime readiness.' }
         if ($Stage -eq 'access') { Write-Host 'Allow RBAC propagation, then run Test-PrivateConnectivity.ps1 from the jumpbox.' }
     } else {
         $result | ConvertTo-Json -Depth 100

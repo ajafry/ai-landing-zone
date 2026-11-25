@@ -71,10 +71,19 @@ foreach ($resource in $resources) {
 if (-not $FoundationOnly) {
     $projectUrl = "https://management.azure.com/subscriptions/$($context.SubscriptionId)/resourceGroups/$($names.spokeResourceGroup)/providers/Microsoft.CognitiveServices/accounts/$($names.foundry)/projects/$($config.projectName)?api-version=2026-07-15-preview"
     $project = Invoke-AzureCli @('rest', '--method', 'get', '--url', $projectUrl)
-    foreach ($store in @('blobStore', 'documentStore', 'vectorStore')) {
-        if ([string]::IsNullOrWhiteSpace($project.properties.capabilitySettings[$store])) {
-            throw "Effective project capability setting is missing: $store"
-        }
+    $hostBindings = @()
+    $connections = @()
+    if (-not $project.properties['capabilitySettings']) {
+        $projectBase = $projectUrl.Split('?')[0]
+        $hostBindings = @((Invoke-AzureCli @('rest', '--method', 'get', '--url', "$projectBase/capabilityHosts?api-version=2025-06-01")).value)
+        $connections = @((Invoke-AzureCli @('rest', '--method', 'get', '--url', "$projectBase/connections?api-version=2025-06-01")).value)
     }
+    $root = "/subscriptions/$($context.SubscriptionId)/resourceGroups/$($names.spokeResourceGroup)/providers"
+    $bindingMode = Assert-ProjectStoreBindings -Project $project -CapabilityHosts $hostBindings -Connections $connections -ExpectedStores @{
+        blobStore = "$root/Microsoft.Storage/storageAccounts/$($names.storage)"
+        documentStore = "$root/Microsoft.DocumentDB/databaseAccounts/$($names.cosmos)"
+        vectorStore = "$root/Microsoft.Search/searchServices/$($names.search)"
+    }
+    Write-Host "Project private stores verified through $bindingMode."
     Write-Host 'Private network checks passed. Run the authenticated model and Agent Service smoke tests in README.md to verify runtime RBAC and agent data access.'
 }

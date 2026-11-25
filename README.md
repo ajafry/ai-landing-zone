@@ -64,14 +64,19 @@ infra\
     monitoring.bicep          Private workspace, App Insights and AMPLS
     hub-diagnostics.bicep     Bastion/firewall diagnostic export
     foundry.bicep             Account, project, model deployments
+    foundry-project.bicep     Isolated project creation with explicit BYO stores
     runtime-access.bicep      Container/database-scoped runtime roles
+    project-provisioning-access.bicep  Dedicated control-plane roles for explicit-host provisioning
+    project-capability-host.bicep      Additive explicit-host recovery without project/account updates
 scripts\
   Common.ps1                  Configuration and CLI helpers
   Preflight.ps1               Permissions, providers, models and VM checks
   Deploy.ps1                  What-if by default; explicit -Apply
+  Provision-ProjectRuntime.ps1 Guarded provisioning stage; healthy projects are a no-op
   Test-PrivateConnectivity.ps1 Private DNS/TCP/PNA checks from jumpbox
 tests\
   Infrastructure.Tests.ps1   Offline regression and syntax checks
+  Provisioning.Tests.ps1     Offline provisioning safety/ordering checks
 ```
 
 ## 1. Prerequisites and deployment permissions
@@ -221,6 +226,10 @@ try {
 
 Close and reopen PowerShell, then run `az version`. For PowerShell 7, use the Windows x64 MSI linked from the [official PowerShell GitHub releases](https://github.com/PowerShell/PowerShell/releases); its release asset host is already approved. Troubleshoot any further failures by their exact hostname without adding blanket internet access.
 
+Azure CLI also needs HTTPS access to `downloads.bicep.azure.com` for Bicep version discovery and downloads when compiling deployment templates. This host is included in the jumpbox allowlist. On an older deployment missing it, review and apply the firewall rule update before running Bicep or deployment what-if; do not disable TLS certificate verification to work around an SSL EOF error.
+
+The portal shell/resource-group list and individual resource blades use different download hosts. The jumpbox HTTPS rule includes the [documented portal hosting endpoints](https://learn.microsoft.com/azure/azure-portal/azure-portal-safelist-urls), including `hosting.portal.azure.net`, `hosting-ms.portal.azure.net`, their wildcard subdomains, `reactblade.portal.azure.net` and `hosting.partners.azure.net`. A wildcard such as `*.hosting.portal.azure.net` does **not** cover the base hostname. Missing these hosts can produce `Microsoft_Azure_ProjectOxford extension failed to load` for Foundry and similar failures for other resource blades, despite successful sign-in/resource listing. Use [Portal Self Help](https://portal.azure.com/selfhelp) or browser developer tools to identify failed requests, correct only the approved frontend allowlist, then hard-refresh the portal. Do not enable public access on workload services or allow blanket internet egress.
+
 Run:
 
 ```powershell
@@ -240,14 +249,33 @@ Run from the jumpbox after caller RBAC has propagated:
 $configPath = '.\infra\config.local.json'
 .\scripts\Deploy.ps1 -Stage foundry -ConfigurationPath $configPath
 .\scripts\Deploy.ps1 -Stage foundry -ConfigurationPath $configPath -Apply -QuotaReviewed
-# Wait for successful project/capability provisioning before the access stage:
+# Verify provisioning, or preview/apply the isolated missing-host path:
+.\scripts\Deploy.ps1 -Stage provisioning -ConfigurationPath $configPath
+.\scripts\Deploy.ps1 -Stage provisioning -ConfigurationPath $configPath -Apply
+# Assign scoped runtime roles only after provisioning reports ready:
 .\scripts\Deploy.ps1 -Stage access -ConfigurationPath $configPath
 .\scripts\Deploy.ps1 -Stage access -ConfigurationPath $configPath -Apply
 ```
 
-The Foundry account is created with injection and all three BYO capability defaults. Its private endpoint registers Cognitive Services, OpenAI and Foundry service domains. The project then inherits capability settings, which provision its underlying data containers/connections. Model deployments are serialized to avoid concurrent account updates.
+The Foundry account is created with injection and all three BYO capability defaults. Its private endpoint registers Cognitive Services, OpenAI and Foundry service domains. The project explicitly declares the same three stores at creation instead of relying solely on inheritance. Successful ARM provisioning and shared connections do not by themselves prove that the project's underlying containers/databases were created; verify them before runtime access. Model deployments are serialized to avoid concurrent account updates.
 
-**The project is not runtime-ready after `foundry` alone.** The `access` wrapper reads the created project identity and discovers the generated `<workspaceId>-azureml-blobstore` and `<workspaceId>-azureml-agent` containers through the Storage management API. It expects one project in this dedicated account and fails if discovery is missing/ambiguous; it does not fall back to account-wide data-owner permissions.
+**The stage order is `hub` → `foundation` → `foundry` → `provisioning` → `access`.** The project is not runtime-ready after `foundry` alone. `provisioning` checks the configured project's identity, bindings and actual backing stores before `access` assigns runtime roles. A healthy project is a read-only no-op, even with `-Apply`; do not redeploy earlier stages just to check provisioning.
+
+The `access` wrapper independently verifies the selected project's store bindings, then reads its identity and discovers its generated file and agent containers through the Storage management API. It matches the project's workspace ID, including any service-generated suffix before `-azureml-agent`, and fails if its containers are missing/ambiguous. Containers belonging to other projects are not selected, and discovery never falls back to account-wide data-owner permissions.
+
+### Guarded provisioning and the explicit-host path
+
+If project creation succeeds but its GET response omits effective capability settings and no backing stores exist, the [documented backward-compatible project capability-host path](https://learn.microsoft.com/azure/foundry/agents/how-to/virtual-networks#permissions) provides an additive alternative. Unlike capability-settings provisioning, it uses the **project managed identity**, not the deployment caller. The integrated `provisioning` stage supports this path deliberately, not as a blind retry after an error.
+
+Without `-Apply`, the stage reads the current state and, only when provisioning is absent, previews both isolated resource-group-scoped Bicep templates. `-Apply` repeats the safety checks and previews before writing. It requires a successfully provisioned account/project, disabled Foundry public access, exactly one healthy account `Agents` host, three correctly bound AAD connections, and **no effective project capability settings, no project host and no project-owned backing data** before considering a host creation.
+
+1. Apply `project-provisioning-access.bicep`: only **Storage Account Contributor** and **Cosmos DB Operator** for the selected project identity on the dedicated resources. Verify both exact-scope assignments, polling up to 30 times at 10-second intervals, then wait 60 seconds for propagation. Visibility and a delay cannot guarantee that every service has refreshed RBAC; a failed host apply is surfaced, not automatically retried.
+2. Re-read the project and host list to reject concurrent configuration changes, repeat the host preview, then apply `project-capability-host.bicep`. Its only write is the missing project `Agents` host named `agents`, reusing the healthy account host's validated connection names. Previews permit only creates/no-changes, never modifications or deletions; permission creates must match the intended resource, principal and role.
+3. Verify the healthy host and the service-created stores: the project's file/agent Blob containers and its three `enterprise_memory` Cosmos containers. Store readiness is polled up to 30 times at 10-second intervals. Only then proceed to the normal `access` preview/apply against the **same project configuration**. Provisioning-role GUIDs match the runtime template, so the control-plane assignments are reused.
+
+A configured project with complete stores is verified and left untouched. Conflicting settings, an unhealthy/ambiguous host, incorrect AAD resource IDs/endpoints, partial data without bindings, or configured-but-incomplete stores fail closed. Wait for in-flight provisioning or investigate the existing configuration; the stage never creates a second host, overwrites immutable settings, manually creates substitute stores, grants account-wide Blob Data Owner, or recreates a project. A failed/uncertain deployment must be inspected before rerunning.
+
+The provisioning stage does not alter account/project properties, models, networking, public-access restrictions, or another project. `Deploy.ps1` orchestrates its two standalone Bicep modules because live checks and RBAC propagation must separate them; `infra\main.bicep` remains responsible for the other four subscription-scoped stages and does not unconditionally mix provisioning paths. Both `access` and the full private-connectivity check continue to support verified effective settings or one healthy explicit host with matching AAD stores.
 
 Runtime role assignments:
 
@@ -277,7 +305,7 @@ From the jumpbox:
 .\scripts\Test-PrivateConnectivity.ps1 -ConfigurationPath $configPath
 ```
 
-The full check additionally verifies the Foundry endpoint and effective project capability settings. DNS/TCP/PNA checks do **not** prove model quota, runtime data roles or every Agent Service tool works. Test both model calls using your Entra identity:
+The full check additionally verifies the Foundry endpoint and intended project stores through effective capability settings or a healthy, correctly bound explicit project host. DNS/TCP/PNA checks do **not** prove model quota, runtime data roles or every Agent Service tool works. Test both model calls using your Entra identity:
 
 ```powershell
 $config = Get-Content $configPath -Raw | ConvertFrom-Json
@@ -312,7 +340,7 @@ az deployment sub what-if --location westus3 --name manual-foundry-review `
     --parameters stage=foundry userObjectId=$userId config=@.\infra\config.local.json
 ```
 
-For `hub`, supply the secure bootstrap password through a protected parameter file, never inline. For `access`, supply discovered `blobContainerName`, `agentContainerName` and `projectPrincipalId`. `Deploy.ps1` provides the safer complete implementation. Use **incremental** deployments and the stage order above, not complete-mode deletion.
+For `hub`, supply the secure bootstrap password through a protected parameter file, never inline. For `access`, supply discovered `blobContainerName`, `agentContainerName` and `projectPrincipalId`. `provisioning` is a wrapper-orchestrated stage, not a `main.bicep` stage; use `Deploy.ps1` so its live guards, two isolated module previews, propagation wait and store verification are not bypassed. Use **incremental** deployments and the stage order above, not complete-mode deletion.
 
 ## Costs, operations and failure recovery
 

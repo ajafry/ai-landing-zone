@@ -12,6 +12,84 @@ function Invoke-AzureCli {
     }
 }
 
+function Assert-ProjectStoreBindings {
+    param(
+        [Parameter(Mandatory)][hashtable] $Project,
+        [Parameter(Mandatory)][hashtable] $ExpectedStores,
+        [object[]] $CapabilityHosts = @(),
+        [object[]] $Connections = @()
+    )
+    $settings = $Project.properties['capabilitySettings']
+    if ($settings) {
+        foreach ($store in @('blobStore', 'documentStore', 'vectorStore')) {
+            if ($settings[$store] -ine $ExpectedStores[$store]) {
+                throw "Effective project capability setting does not match the intended resource: $store"
+            }
+        }
+        return 'capabilitySettings'
+    }
+
+    Assert-ProjectHostBindings -ExpectedStores $ExpectedStores -CapabilityHosts $CapabilityHosts -Connections $Connections
+    return 'capabilityHost'
+}
+
+function Assert-ProjectHostBindings {
+    param(
+        [Parameter(Mandatory)][hashtable] $ExpectedStores,
+        [object[]] $CapabilityHosts = @(),
+        [object[]] $Connections = @()
+    )
+    if ($CapabilityHosts.Count -ne 1 -or
+        $CapabilityHosts[0].properties['provisioningState'] -ne 'Succeeded' -or
+        $CapabilityHosts[0].properties['capabilityHostKind'] -ne 'Agents') {
+        throw 'Project has neither effective capability settings nor exactly one healthy Agents capability host.'
+    }
+    $bindingProperties = @{
+        blobStore = 'storageConnections'
+        documentStore = 'threadStorageConnections'
+        vectorStore = 'vectorStoreConnections'
+    }
+    $suffixes = @{
+        blobStore = '.blob.core.windows.net'
+        documentStore = '.documents.azure.com'
+        vectorStore = '.search.windows.net'
+    }
+    foreach ($store in @('blobStore', 'documentStore', 'vectorStore')) {
+        $names = @($CapabilityHosts[0].properties[$bindingProperties[$store]])
+        if ($names.Count -ne 1 -or [string]::IsNullOrWhiteSpace($names[0])) {
+            throw "Project host must bind exactly one $store connection."
+        }
+        $matching = @($Connections | Where-Object name -eq $names[0])
+        $expectedTarget = "https://$($ExpectedStores[$store].Split('/')[-1])$($suffixes[$store])"
+        if ($matching.Count -ne 1 -or $matching[0].properties['authType'] -ne 'AAD' -or
+            -not $matching[0].properties['metadata'] -or
+            $matching[0].properties.metadata['ResourceId'] -ine $ExpectedStores[$store] -or
+            ([string] $matching[0].properties['target']).TrimEnd('/') -ine $expectedTarget) {
+            throw "Project host $store connection does not match the intended AAD resource."
+        }
+    }
+}
+
+function Get-ProjectRuntimeContainers {
+    param(
+        [Parameter(Mandatory)][string] $ProjectInternalId,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Containers
+    )
+    $workspaceId = [guid]::Empty
+    if (-not [guid]::TryParse($ProjectInternalId, [ref] $workspaceId) -or $workspaceId -eq [guid]::Empty) {
+        throw 'Project workspace identity is invalid; cannot safely select its backing containers.'
+    }
+    $prefix = "$($workspaceId.ToString())-"
+    $files = @($Containers | Where-Object { $_.name -eq "${prefix}azureml-blobstore" })
+    $agents = @($Containers | Where-Object {
+        $_.name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and $_.name -like '*-azureml-agent'
+    })
+    if ($files.Count -ne 1 -or $agents.Count -ne 1) {
+        throw 'Expected exactly one Foundry file container and one agent container for this project. Inspect capability provisioning; do not grant account-wide data-owner access.'
+    }
+    return @{ Files = $files[0].name; Agents = $agents[0].name }
+}
+
 function Get-NetworkRange {
     param([Parameter(Mandatory)][string] $Cidr)
     if ($Cidr -notmatch '^(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})$') {

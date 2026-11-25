@@ -47,6 +47,71 @@ $copy = Get-Content $defaultPath -Raw | ConvertFrom-Json -AsHashtable
 $copy.models[1].deploymentName = $copy.models[0].deploymentName
 Assert-Rejected $copy 'unique'
 
+$expectedStores = @{
+    blobStore = '/subscriptions/test/resourceGroups/test/providers/Microsoft.Storage/storageAccounts/teststorage'
+    documentStore = '/subscriptions/test/resourceGroups/test/providers/Microsoft.DocumentDB/databaseAccounts/testcosmos'
+    vectorStore = '/subscriptions/test/resourceGroups/test/providers/Microsoft.Search/searchServices/testsearch'
+}
+$boundProject = @{ properties = @{ capabilitySettings = @{} + $expectedStores } }
+Assert-True ((Assert-ProjectStoreBindings -Project $boundProject -ExpectedStores $expectedStores) -eq 'capabilitySettings') 'Expected explicit project bindings to be accepted.'
+$hostFixture = @{
+    properties = @{
+        provisioningState = 'Succeeded'
+        capabilityHostKind = 'Agents'
+        storageConnections = @('blob')
+        threadStorageConnections = @('cosmos')
+        vectorStoreConnections = @('search')
+    }
+}
+$connectionFixture = @(
+    @{ name = 'blob'; properties = @{ authType = 'AAD'; target = 'https://teststorage.blob.core.windows.net/'; metadata = @{ ResourceId = $expectedStores.blobStore } } },
+    @{ name = 'cosmos'; properties = @{ authType = 'AAD'; target = 'https://testcosmos.documents.azure.com/'; metadata = @{ ResourceId = $expectedStores.documentStore } } },
+    @{ name = 'search'; properties = @{ authType = 'AAD'; target = 'https://testsearch.search.windows.net/'; metadata = @{ ResourceId = $expectedStores.vectorStore } } }
+)
+Assert-True ((Assert-ProjectStoreBindings -Project @{ properties = @{} } -ExpectedStores $expectedStores -CapabilityHosts @($hostFixture) -Connections $connectionFixture) -eq 'capabilityHost') 'A healthy explicit host with matching AAD stores must be supported when effective settings are absent.'
+foreach ($scenario in @('no-host', 'unhealthy-host', 'wrong-resource', 'wrong-target', 'wrong-settings')) {
+    $hostCopy = $hostFixture | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+    $connectionCopy = $connectionFixture | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+    $projectCopy = @{ properties = @{} }
+    $hosts = @($hostCopy)
+    switch ($scenario) {
+        'no-host' { $hosts = @() }
+        'unhealthy-host' { $hostCopy.properties.provisioningState = 'Creating' }
+        'wrong-resource' { $connectionCopy[0].properties.metadata.ResourceId = "$($expectedStores.blobStore)-other" }
+        'wrong-target' { $connectionCopy[0].properties.target = 'https://unrelated.blob.core.windows.net/' }
+        'wrong-settings' {
+            $projectCopy.properties.capabilitySettings = @{} + $expectedStores
+            $projectCopy.properties.capabilitySettings.blobStore = "$($expectedStores.blobStore)-other"
+        }
+    }
+    $rejected = $false
+    try { $null = Assert-ProjectStoreBindings -Project $projectCopy -ExpectedStores $expectedStores -CapabilityHosts $hosts -Connections $connectionCopy }
+    catch { $rejected = $true }
+    Assert-True $rejected "Unsafe project bindings were accepted: $scenario"
+}
+$workspaceId = '11111111-2222-3333-4444-555555555555'
+$otherWorkspaceId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+$projectContainers = @(
+    @{ name = "$workspaceId-azureml-blobstore" },
+    @{ name = "$workspaceId-random-azureml-agent" }
+)
+$otherContainers = @(
+    @{ name = "$otherWorkspaceId-azureml-blobstore" },
+    @{ name = "$otherWorkspaceId-random-azureml-agent" }
+)
+$selected = Get-ProjectRuntimeContainers -ProjectInternalId $workspaceId.Replace('-', '') -Containers ($projectContainers + $otherContainers)
+Assert-True ($selected.Files -eq $projectContainers[0].name -and $selected.Agents -eq $projectContainers[1].name) 'Container discovery must select the configured project, not another project in the same stores.'
+foreach ($candidates in @(
+    @{ Value = @() },
+    @{ Value = $otherContainers },
+    @{ Value = $projectContainers + @(@{ name = "$workspaceId-duplicate-azureml-agent" }) }
+)) {
+    $rejected = $false
+    try { $null = Get-ProjectRuntimeContainers -ProjectInternalId $workspaceId -Containers $candidates.Value }
+    catch { $rejected = $true }
+    Assert-True $rejected 'Missing or ambiguous project-owned containers must fail closed.'
+}
+
 $template = Invoke-AzureCli @('bicep', 'build', '--file', (Join-Path $PSScriptRoot '..\infra\main.bicep'), '--stdout')
 $resources = @(Get-TemplateResources $template)
 Assert-True ($template.parameters.adminPassword.type -eq 'secureString') 'Bootstrap password must be secure.'
@@ -71,6 +136,18 @@ foreach ($resource in $monitorResources) {
 }
 $publicIps = @($resources | Where-Object { $_.type -eq 'Microsoft.Network/publicIPAddresses' })
 Assert-True ($publicIps.Count -eq 2) 'Only Bastion and outbound Firewall should have public IPs.'
+$egressDeployment = @($resources | Where-Object {
+    $_.type -eq 'Microsoft.Resources/deployments' -and
+    $_.properties.template -and
+    $_.properties.template.ContainsKey('variables') -and
+    $_.properties.template.variables.ContainsKey('portalFqdns')
+})[0]
+Assert-True ($egressDeployment.properties.template.variables.portalFqdns -contains 'downloads.bicep.azure.com') 'Jumpbox tooling requires the Bicep version/download host over approved HTTPS.'
+foreach ($hostName in @('hosting.portal.azure.net', '*.hosting.portal.azure.net',
+    'hosting-ms.portal.azure.net', '*.hosting-ms.portal.azure.net',
+    'reactblade.portal.azure.net', '*.reactblade.portal.azure.net', 'hosting.partners.azure.net')) {
+    Assert-True ($egressDeployment.properties.template.variables.portalFqdns -contains $hostName) "Portal resource blades require the documented hosting endpoint, including apex hosts: $hostName"
+}
 Assert-True (@($resources | Where-Object { $_.type -eq 'Microsoft.Network/privateEndpoints' }).Count -eq 6) 'All six workload private endpoints must exist.'
 $nics = @($resources | Where-Object { $_.type -eq 'Microsoft.Network/networkInterfaces' })
 foreach ($nic in $nics) {
@@ -105,12 +182,42 @@ Assert-True ($account.properties.capabilitySettings.Keys.Count -eq 3) 'All three
 Assert-True ($account.properties.networkInjections[0].scenario -eq 'agent') 'Agent injection missing.'
 Assert-True ($account.properties.networkAcls.bypass -eq 'None') 'Foundry must not allow trusted-service bypass.'
 Assert-True ($account.properties.disableLocalAuth -eq $true) 'Foundry key authentication enabled.'
+$projectDeployment = @($resources | Where-Object { $_.name -eq 'foundry-project' })[0]
+$projectSettings = $projectDeployment.properties.parameters.capabilitySettings.value
+foreach ($store in @('blobStore', 'documentStore', 'vectorStore')) {
+    Assert-True ($projectSettings[$store] -eq $account.properties.capabilitySettings[$store]) "Project must explicitly bind the account's intended $store."
+}
+$projectTemplate = $projectDeployment.properties.template
+$projects = @((Get-TemplateResources $projectTemplate) | Where-Object { $_.type -eq 'Microsoft.CognitiveServices/accounts/projects' })
+Assert-True ($projects.Count -eq 1 -and $projects[0].properties.capabilitySettings -eq "[parameters('capabilitySettings')]") 'Isolated project deployment must submit explicit capability settings.'
+Assert-True (@((Get-TemplateResources $projectTemplate) | Where-Object { $_.type -ne 'Microsoft.CognitiveServices/accounts/projects' }).Count -eq 0) 'Project recovery must not redeploy the account, models or networking.'
+$provisioningTemplate = Invoke-AzureCli @('bicep', 'build', '--file', (Join-Path $PSScriptRoot '..\infra\modules\project-provisioning-access.bicep'), '--stdout')
+$provisioningResources = @(Get-TemplateResources $provisioningTemplate)
+Assert-True ($provisioningResources.Count -eq 2) 'Explicit-host provisioning must grant only the two dedicated resource control-plane roles.'
+foreach ($resource in $provisioningResources) {
+    Assert-True ($resource.type -eq 'Microsoft.Authorization/roleAssignments') 'Provisioning access must not write workload resources.'
+    Assert-True ($resource.properties.principalId -eq "[parameters('projectPrincipalId')]") 'Provisioning roles must target only the selected project identity.'
+    Assert-True ($resource.scope -match 'Microsoft.Storage/storageAccounts|Microsoft.DocumentDB/databaseAccounts') 'Provisioning access must not grant resource-group or subscription roles.'
+    Assert-True ($resource.properties.roleDefinitionId -match '17d1049b-9a84-46fb-8f53-869881c3d3ab|230815da-be43-4aae-9cb4-875f7bd000aa') 'Provisioning must not grant account-wide blob owner or data access.'
+}
+$hostTemplate = Invoke-AzureCli @('bicep', 'build', '--file', (Join-Path $PSScriptRoot '..\infra\modules\project-capability-host.bicep'), '--stdout')
+$hostResources = @(Get-TemplateResources $hostTemplate)
+Assert-True ($hostResources.Count -eq 1 -and $hostResources[0].type -eq 'Microsoft.CognitiveServices/accounts/projects/capabilityHosts') 'Explicit-host recovery must not redeploy the account, project, connections or networking.'
+$hostProperties = $hostResources[0].properties
+Assert-True ($hostProperties.capabilityHostKind -eq 'Agents') 'Project host must explicitly select Agents; an untyped host is not runtime-ready.'
+foreach ($binding in @(
+    @{ Property = 'storageConnections'; Parameter = 'blobConnectionName' },
+    @{ Property = 'threadStorageConnections'; Parameter = 'cosmosConnectionName' },
+    @{ Property = 'vectorStoreConnections'; Parameter = 'searchConnectionName' }
+)) {
+    Assert-True ($hostProperties[$binding.Property].Count -eq 1 -and $hostProperties[$binding.Property][0] -eq "[parameters('$($binding.Parameter)')]") 'Explicit host must bind all three selected connections.'
+}
 foreach ($resource in @($resources | Where-Object { $_.type -in @('Microsoft.DocumentDB/databaseAccounts', 'Microsoft.Search/searchServices') })) {
     Assert-True ($resource.properties.disableLocalAuth -eq $true) 'Dependent services must disable local-key authentication.'
 }
 $storage = @($resources | Where-Object { $_.type -eq 'Microsoft.Storage/storageAccounts' })[0]
 Assert-True ($storage.properties.allowSharedKeyAccess -eq $false -and $storage.properties.allowBlobPublicAccess -eq $false) 'Storage must reject shared keys and anonymous Blob access.'
-Assert-True (@($resources | Where-Object { $_.type -like '*capabilityHosts' }).Count -eq 0) 'Do not mix legacy capability hosts and current capability settings.'
+Assert-True (@($resources | Where-Object { $_.type -like '*capabilityHosts' }).Count -eq 0) 'Main must not unconditionally mix provisioning paths; explicit hosts belong only in the guarded provisioning stage.'
 $dnsTemplate = @($resources | Where-Object { $_.name -eq 'shared-private-dns' })[0].properties.template
 Assert-True (@((Get-TemplateResources $dnsTemplate) | Where-Object { $_.type -eq 'Microsoft.Network/privateDnsZones/virtualNetworkLinks' }).Count -eq 2) 'DNS zones must link to both VNets.'
 $runtimeTemplate = @($resources | Where-Object { $_.name -eq 'project-runtime-access' })[0].properties.template
@@ -279,4 +386,5 @@ if ($IsWindows) {
         Remove-Variable LandingZoneTestState -Scope Global
     }
 }
+& (Join-Path $PSScriptRoot 'Provisioning.Tests.ps1')
 Write-Host 'Offline infrastructure and configuration checks passed.'
